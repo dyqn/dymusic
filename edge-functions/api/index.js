@@ -1,0 +1,418 @@
+/**
+ * Meting API - EdgeOne Pages Edge Functions 版
+ * 基于 xizeyoupan/Meting-API 移植，仅支持网易云（netease）音源
+ *
+ * 文件路径 edge-functions/api/index.js → 路由 /api
+ * 访问示例：https://music.shijuefuhao.com/api?server=netease&type=playlist&id=21158650
+ */
+
+// ==================== 辅助函数 ====================
+
+function base64Encode(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function hexEncode(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let hex = '';
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, '0');
+  }
+  return hex;
+}
+
+function strToBytes(str) {
+  return new TextEncoder().encode(str);
+}
+
+// ==================== 加密模块 ====================
+
+const AES_IV = strToBytes('0102030405060708');
+const PRESET_KEY = strToBytes('0CoJUm6Qyw8W8jud');
+const BASE62 = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+const NETEASE_ANONYMOUS_TOKEN = 'de91e1f8119d32e01cc73efcb82c0a30c9137e8d4f88dbf5e3d7bf3f28998f21add2bc8204eeee5e56c0bbb8743574b46ca2c10c35dc172199bef9bf4d60ecdeab066bb4dc737d1c3324751bcc9aaf44c3061cd18d77b7a0';
+
+// 网易云 RSA 公钥参数（固定公开值，硬编码以规避 EdgeOne 边缘函数 crypto.subtle.importKey 兼容性问题）
+const NETEASE_RSA_N = 157794750267131502212476817800345498121872783333389747424011531025366277535262539913701806290766479189477533597854989606803194253978660329941980786072432806427833685472618792592200595694346872951301770580765135349259590167490536138082469680638514416594216629258349130257685001248172188325316586707301643237607n;
+const NETEASE_RSA_E = 65537n;
+
+function getRsaKey() {
+  return { n: NETEASE_RSA_N, e: NETEASE_RSA_E };
+}
+
+// AES-128-CBC 加密（Web Crypto API）
+async function aesCbcEncrypt(data, key, iv) {
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw', key, { name: 'AES-CBC' }, false, ['encrypt']
+  );
+  return await crypto.subtle.encrypt({ name: 'AES-CBC', iv: iv }, cryptoKey, data);
+}
+
+// RSA NO PADDING 加密（BigInt 实现）
+function rsaNoPadding(buffer, n, e) {
+  // 前面补 0 到 128 字节（1024 位 RSA）
+  const padded = new Uint8Array(128);
+  padded.set(buffer, 128 - buffer.length);
+  // 转为 BigInt
+  let m = 0n;
+  for (let i = 0; i < padded.length; i++) {
+    m = (m << 8n) | BigInt(padded[i]);
+  }
+  // 模幂运算 m^e mod n
+  let result = 1n;
+  let base = m % n;
+  let exp = e;
+  while (exp > 0n) {
+    if (exp & 1n) result = (result * base) % n;
+    base = (base * base) % n;
+    exp >>= 1n;
+  }
+  // 转回字节数组
+  const hex = result.toString(16).padStart(256, '0');
+  const bytes = new Uint8Array(128);
+  for (let i = 0; i < 128; i++) {
+    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+  }
+  return bytes;
+}
+
+// weapi 加密
+async function weapiEncrypt(object) {
+  const text = JSON.stringify(object);
+  const textBytes = strToBytes(text);
+
+  // 生成随机 secretKey
+  const randomBytes = crypto.getRandomValues(new Uint8Array(16));
+  const secretKey = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) {
+    secretKey[i] = BASE62.charCodeAt(randomBytes[i] % 62);
+  }
+
+  // 第一次 AES-CBC: text -> presetKey
+  const encrypted1 = await aesCbcEncrypt(textBytes, PRESET_KEY, AES_IV);
+  const encrypted1Base64 = base64Encode(encrypted1);
+  const encrypted1Bytes = strToBytes(encrypted1Base64);
+
+  // 第二次 AES-CBC: encrypted1Base64 -> secretKey
+  const encrypted2 = await aesCbcEncrypt(encrypted1Bytes, secretKey, AES_IV);
+  const params = base64Encode(encrypted2);
+
+  // RSA: secretKey 反转后加密
+  const reversedKey = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) {
+    reversedKey[i] = secretKey[15 - i];
+  }
+  const { n, e } = getRsaKey();
+  const encSecKey = hexEncode(rsaNoPadding(reversedKey, n, e));
+
+  return { params, encSecKey };
+}
+
+// ==================== 网易云 API ====================
+
+// 国内 IP 段（用于伪装请求来源）
+const CN_IPS = '58.14.0.0,118.88.88.88,221.234.0.0,180.76.0.0,123.125.0.0,121.42.0.0,222.73.0.0,120.78.0.0,112.74.0.0,139.196.0.0'.split(',');
+
+function randomCnIp() {
+  return CN_IPS[Math.floor(Math.random() * CN_IPS.length)];
+}
+
+function nanoid() {
+  const chars = '1234567890abcdef';
+  let id = '';
+  const random = crypto.getRandomValues(new Uint8Array(32));
+  for (let i = 0; i < 32; i++) {
+    id += chars[random[i] % chars.length];
+  }
+  return id;
+}
+
+// 发送网易云请求
+async function neteaseRequest(url, data, cryptoMode) {
+  let bodyData = data;
+  let reqUrl = url;
+
+  if (cryptoMode === 'weapi') {
+    data.csrf_token = '';
+    bodyData = await weapiEncrypt(data);
+    reqUrl = url.replace(/\w*api/, 'weapi');
+  }
+  // 'api' 模式：不加密，直接发送
+
+  // EdgeOne 运行时的 URLSearchParams 要求所有值为字符串，统一转换避免 TypeError
+  const bodyDataEntries = Object.entries(bodyData).map(([k, v]) => [k, String(v)]);
+  const body = new URLSearchParams(bodyDataEntries).toString();
+  let res, count = 0;
+  do {
+    // 每次重试都重新生成 X-Real-IP，避免被网易云风控连续拦截
+    const headers = {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Referer': 'https://music.163.com/',
+      'Cookie': 'appver=8.2.30; os=iPhone OS; osver=15.0; EVNSM=1.0.0; buildver=2206; channel=distribution; machineid=iPhone13.3',
+      'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 CloudMusic/0.1.1 NeteaseMusic/8.2.30',
+      'X-Real-IP': randomCnIp(),
+      'Accept': '*/*',
+      'Accept-Language': 'zh-CN,zh;q=0.8,gl;q=0.6,zh-TW;q=0.4',
+      'Connection': 'keep-alive',
+    };
+    res = await fetch(reqUrl, { method: 'POST', headers, body });
+    res = await res.json();
+    count++;
+    if (res.code !== -460) break;
+    if (count > 5) break;
+    // 指数退避：100ms / 200ms / 400ms / 800ms / 1600ms
+    await new Promise(resolve => setTimeout(resolve, 100 * Math.pow(2, count - 1)));
+  } while (res.code === -460);
+
+  return res;
+}
+
+// 映射歌曲列表
+function mapSongList(songList) {
+  return songList.songs.map(song => {
+    const artists = song.ar || song.artists || [];
+    return {
+      title: song.name,
+      author: artists.reduce((acc, v) => (acc ? acc + ' / ' : '') + v.name, ''),
+      pic: (song.al && song.al.picUrl) || song.id,
+      url: song.id,
+      lrc: song.id,
+    };
+  });
+}
+
+// 获取歌单
+async function getPlaylist(id) {
+  // 第一步：获取歌单 trackIds（不加密）
+  let res = await neteaseRequest(
+    'https://music.163.com/api/v6/playlist/detail',
+    { id, n: 100000, s: 8 },
+    'api'
+  );
+
+  const trackIds = res.playlist.trackIds;
+  // 网易云 /api/v3/song/detail 单次请求上限 200 首，分批获取全部歌曲
+  const limit = 200;
+  const targetIds = trackIds;
+
+  // 第二步：分批获取歌曲详情（weapi 加密），逐批累加到 songList
+  let songList = [];
+  for (let offset = 0; offset < targetIds.length; offset += limit) {
+    const batch = targetIds.slice(offset, offset + limit);
+    const idsData = {
+      c: '[' + batch.map(item => '{"id":' + item.id + '}').join(',') + ']',
+    };
+    const batchRes = await neteaseRequest(
+      'https://music.163.com/api/v3/song/detail',
+      idsData,
+      'weapi'
+    );
+    songList = songList.concat(mapSongList(batchRes));
+  }
+
+  return songList;
+}
+
+// 获取单曲信息
+async function getSongInfo(id) {
+  const data = {
+    c: '[{"id":' + id + '}]',
+  };
+  const res = await neteaseRequest(
+    'https://music.163.com/api/v3/song/detail',
+    data,
+    'weapi'
+  );
+  if (!res.songs) throw res;
+  return mapSongList(res);
+}
+
+// 获取播放 URL（weapi 接口获取真实播放地址）
+async function getSongUrl(id) {
+  const res = await neteaseRequest(
+    'https://music.163.com/api/song/enhance/player/url',
+    { ids: [id], br: 320000 },
+    'weapi'
+  );
+  const item = res && res.data && res.data[0];
+  if (!item) return '';
+  // 优先使用 uf.url（备用地址），其次用 url
+  const url = (item.uf && item.uf.url) || item.url || '';
+  // 网易云返回的 http 链接需替换为 https
+  return url ? url.replace(/^http:/, 'https:') : '';
+}
+
+// 获取歌词
+async function getLyric(id) {
+  const res = await neteaseRequest(
+    'https://music.163.com/api/song/lyric?_nmclfl=1',
+    { id, tv: -1, lv: -1, rv: -1, kv: -1 },
+    'api'
+  );
+  return {
+    lyric: (res.lrc && res.lrc.lyric) || '',
+    tlyric: (res.tlyric && res.tlyric.lyric) || '',
+  };
+}
+
+// ==================== 歌词格式化 ====================
+
+function formatLyric(lyric, tlyric) {
+  const lyricArray = trimLyric(lyric);
+  const tlyricArray = trimLyric(tlyric);
+  if (tlyricArray.length === 0) return lyric;
+
+  const result = [];
+  for (let i = 0, j = 0; i < lyricArray.length && j < tlyricArray.length; i++) {
+    const time = lyricArray[i].time;
+    let text = lyricArray[i].text;
+    while (time > tlyricArray[j].time && j + 1 < tlyricArray.length) j++;
+    if (time === tlyricArray[j].time && tlyricArray[j].text.length) {
+      text = text + ' (' + tlyricArray[j].text + ')';
+    }
+    result.push({ time, text });
+  }
+
+  return result.map(x => {
+    const mm = Math.floor(x.time / 60000).toString().padStart(2, '0');
+    const ss = Math.floor((x.time % 60000) / 1000).toString().padStart(2, '0');
+    const ms = Math.floor(x.time % 1000).toString().padStart(3, '0');
+    return '[' + mm + ':' + ss + '.' + ms + ']' + x.text;
+  }).join('\n');
+}
+
+function trimLyric(lyric) {
+  const result = [];
+  const lines = lyric.split('\n');
+  for (const line of lines) {
+    const match = line.match(/^\[(\d{2}):(\d{2})[.:](\d+)\](.*)$/);
+    if (match) {
+      const minutes = parseInt(match[1], 10);
+      const seconds = parseInt(match[2], 10);
+      const milliseconds = parseInt(match[3].padEnd(3, '0').slice(0, 3), 10);
+      result.push({
+        time: minutes * 60000 + seconds * 1000 + milliseconds,
+        text: match[4],
+      });
+    }
+  }
+  return result.sort((a, b) => a.time - b.time);
+}
+
+// ==================== 响应辅助 ====================
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    },
+  });
+}
+
+function textResponse(text, status = 200) {
+  return new Response(text, {
+    status,
+    headers: {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Access-Control-Allow-Origin': '*',
+    },
+  });
+}
+
+function redirectResponse(url) {
+  return new Response(null, {
+    status: 302,
+    headers: {
+      'Location': url,
+      'Access-Control-Allow-Origin': '*',
+    },
+  });
+}
+
+// ==================== 主处理函数（EdgeOne Pages Edge Functions 入口） ====================
+
+export default async function onRequest({ request }) {
+  const url = new URL(request.url);
+  const params = url.searchParams;
+
+  const server = params.get('server') || 'netease';
+  const type = params.get('type') || 'playlist';
+  const id = params.get('id');
+
+  // 仅支持网易云
+  if (server !== 'netease') {
+    return jsonResponse({ error: '仅支持 netease（网易云）音源' }, 400);
+  }
+
+  if (!id) {
+    return jsonResponse({ error: '缺少 id 参数' }, 400);
+  }
+
+  try {
+    let data;
+    switch (type) {
+      case 'playlist': {
+        data = await getPlaylist(id);
+        const baseUrl = url.origin + url.pathname;
+        data = data.map(x => {
+          for (const key of ['url', 'pic', 'lrc']) {
+            const val = String(x[key]);
+            if (!val.startsWith('@') && !val.startsWith('http') && val.length > 0) {
+              x[key] = baseUrl + '?server=netease&type=' + key + '&id=' + val;
+            }
+          }
+          return x;
+        });
+        return jsonResponse(data);
+      }
+      case 'song': {
+        data = await getSongInfo(id);
+        const baseUrl2 = url.origin + url.pathname;
+        data = data.map(x => {
+          for (const key of ['url', 'pic', 'lrc']) {
+            const val = String(x[key]);
+            if (!val.startsWith('@') && !val.startsWith('http') && val.length > 0) {
+              x[key] = baseUrl2 + '?server=netease&type=' + key + '&id=' + val;
+            }
+          }
+          return x;
+        });
+        return jsonResponse(data);
+      }
+      case 'url':
+        data = await getSongUrl(id);
+        if (data && data.startsWith('http')) return redirectResponse(data);
+        return textResponse('no url', 404);
+
+      case 'pic': {
+        const songInfo = await getSongInfo(id);
+        data = songInfo[0].pic;
+        if (data && data.startsWith('http')) return redirectResponse(data);
+        return textResponse('no pic', 404);
+      }
+      case 'lrc': {
+        const lyricData = await getLyric(id);
+        return textResponse(formatLyric(lyricData.lyric, lyricData.tlyric || ''));
+      }
+      default:
+        return jsonResponse({ error: '不支持的 type: ' + type }, 400);
+    }
+  } catch (e) {
+    // 返回详细错误信息便于诊断（含 name/message/stack）
+    const errInfo = {
+      error: String(e),
+      name: e && e.name,
+      message: e && e.message,
+      stack: e && e.stack ? e.stack.split('\n').slice(0, 5).join('\n') : null,
+    };
+    return jsonResponse(errInfo, 500);
+  }
+}
