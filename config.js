@@ -1,5 +1,5 @@
 // Meting API 地址（EdgeOne 边缘函数）
-window.meting_api = 'https://music.shijuefuhao.com/api?server=:server&type=:type&id=:id&r=:r';
+window.meting_api = 'https://music.dyqn.com/api?server=:server&type=:type&id=:id&r=:r';
 
 var userId = "21158650";
 var userServer = "netease";
